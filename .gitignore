@@ -21,4 +21,4 @@ dist/
 *.log
 
 #dmg files
-.dmg-staging/
+dmg-staging/
