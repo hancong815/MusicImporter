@@ -1,0 +1,12 @@
+MusicImporter 安装说明
+
+1. 将 MusicImporter.app 拖入 Applications（应用程序）。
+2. 启动应用。
+
+注意：
+当前版本依赖 FFmpeg。
+如果启动后提示未检测到 FFmpeg，请安装 Homebrew 后执行：
+
+brew install ffmpeg
+
+然后重新启动 MusicImporter。
