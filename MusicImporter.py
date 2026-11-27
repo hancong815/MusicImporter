@@ -13,6 +13,14 @@ import subprocess
 import threading
 import tkinter as tk
 import unicodedata
+import logging
+import platform
+import sys
+import shlex
+import time
+import json
+import urllib.parse
+import urllib.request
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path as P
 
@@ -44,17 +52,63 @@ REMOVE_PATTERNS = [
 TRACK_PREFIX = re.compile(r"^\s*(?:(?:track\s*)?(\d{1,3})\s*[-._、)]\s*|(\d{1,3})\s+|(\d{1,3})(?=[\u4e00-\u9fffA-Za-z]))", re.I)
 
 
+def setup_diagnostic_logger():
+    """Create a persistent diagnostic log in the user's macOS Logs folder."""
+    logger = logging.getLogger("MusicImporter")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    if logger.handlers:
+        return logger
+    try:
+        log_dir = P.home() / "Library" / "Logs" / "MusicImporter"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "musicimporter.log"
+    except Exception:
+        # Fallback is useful if the home Logs directory is unavailable.
+        log_path = P(os.environ.get("TMPDIR", "/tmp")) / "musicimporter.log"
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(handler)
+    logger.info("========== MusicImporter diagnostic session started ==========")
+    logger.info("Log file: %s", log_path)
+    logger.info("Python: %s | executable=%s", sys.version.replace("\n", " "), sys.executable)
+    logger.info("Platform: %s | machine=%s | processor=%s", platform.platform(), platform.machine(), platform.processor())
+    logger.info("Process architecture: %s | app bundle=%s", platform.architecture(), bool(getattr(sys, "frozen", False)))
+    logger.info("Working directory: %s | argv=%s", os.getcwd(), sys.argv)
+    logger.info("PATH=%s", os.environ.get("PATH", ""))
+    return logger
+
+
+DIAG_LOG = setup_diagnostic_logger()
+
+
+def log_file_info(label, path):
+    try:
+        stat = P(path).stat()
+        logger = logging.getLogger("MusicImporter")
+        logger.info("%s: path=%s | size=%d bytes (%.2f MiB) | modified=%s", label, path, stat.st_size,
+                    stat.st_size / (1024 * 1024), stat.st_mtime)
+    except Exception:
+        logging.getLogger("MusicImporter").info("%s: path=%s | file info unavailable", label, path)
+
+
 def find_ffmpeg():
     candidates = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "ffmpeg"]
+    logger = logging.getLogger("MusicImporter")
     for candidate in candidates:
+        logger.info("Checking FFmpeg candidate: %s", candidate)
         if candidate == "ffmpeg":
             try:
-                subprocess.run([candidate, "-version"], capture_output=True, check=True)
+                subprocess.run([candidate, "-version"], capture_output=True, text=True, check=True, timeout=10)
+                resolved = subprocess.run(["which", candidate], capture_output=True, text=True, timeout=5).stdout.strip() or candidate
+                logger.info("FFmpeg selected from PATH: %s (resolved=%s)", candidate, resolved)
                 return candidate
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.info("FFmpeg candidate unavailable: %s (%s)", candidate, exc)
         elif os.path.isfile(candidate):
+            logger.info("FFmpeg selected: %s", candidate)
             return candidate
+    logger.error("No FFmpeg executable found")
     return None
 
 
@@ -90,6 +144,331 @@ def read_tags(path):
     except Exception:
         empty["title"] = P(path).stem
     return empty
+
+
+
+def read_lyrics(path):
+    """Read embedded lyrics from common audio tag formats without altering text."""
+    try:
+        from mutagen import File as MutagenFile
+        audio = MutagenFile(str(path))
+        tags = getattr(audio, "tags", None) if audio else None
+        if not tags:
+            return ""
+        # ID3 unsynchronized lyrics (MP3/AIFF/WAV) are stored in USLT frames.
+        try:
+            frames = tags.getall("USLT") if hasattr(tags, "getall") else []
+            for frame in frames:
+                if getattr(frame, "text", None):
+                    return str(frame.text)
+        except Exception:
+            pass
+        # MP4/M4A lyric atom, Vorbis comments, and common alternate lyric keys.
+        for key in ("\u00a9lyr", "lyrics", "LYRICS", "UNSYNCEDLYRICS"):
+            try:
+                value = tags.get(key) if hasattr(tags, "get") else None
+            except (KeyError, ValueError, TypeError):
+                # Some Mutagen tag containers raise ValueError for keys that
+                # are invalid for their container instead of returning None.
+                continue
+            if value:
+                if isinstance(value, (list, tuple)):
+                    value = value[0]
+                return str(value)
+        # Fallback through Mutagen's easy interface for other supported formats.
+        easy = MutagenFile(str(path), easy=True)
+        if easy and easy.tags:
+            value = easy.tags.get("lyrics") or easy.tags.get("unsyncedlyrics")
+            if value:
+                return str(value[0] if isinstance(value, (list, tuple)) else value)
+    except Exception:
+        logging.getLogger("MusicImporter").exception("LYRICS READ FAILED | source=%s", path)
+    return ""
+
+
+def write_lyrics(path, lyrics):
+    """Write lyrics to destination's native tag, retaining Unicode text."""
+    if not lyrics:
+        return False
+    ext = P(path).suffix.lower()
+    from mutagen import File as MutagenFile
+    audio = MutagenFile(str(path))
+    if audio is None:
+        raise RuntimeError(f"无法识别歌词输出格式：{P(path).name}")
+    tags = getattr(audio, "tags", None)
+    if tags is None:
+        try:
+            audio.add_tags()
+            tags = audio.tags
+        except Exception as exc:
+            raise RuntimeError(f"目标格式不支持写入歌词：{P(path).name}") from exc
+    if ext in {".mp3", ".aiff", ".aif", ".wav"}:
+        from mutagen.id3 import USLT
+        if hasattr(tags, "delall"):
+            tags.delall("USLT")
+            tags.add(USLT(encoding=3, lang="eng", desc="", text=lyrics))
+        else:
+            raise RuntimeError(f"该文件无法写入 ID3 歌词：{P(path).name}")
+    elif ext in {".m4a", ".aac"}:
+        tags["\u00a9lyr"] = [lyrics]
+    elif ext in {".flac", ".ogg", ".opus"}:
+        tags["LYRICS"] = [lyrics]
+    else:
+        raise RuntimeError(f"暂不支持此输出格式的歌词写入：{ext}")
+    audio.save()
+    return True
+
+
+def _lyric_garble_score(text):
+    if not text:
+        return 0.0
+    suspicious = sum(text.count(ch) for ch in ("\ufffd", "Ã", "Â", "â€", "æ", "å", "ä", "ï¿"))
+    # Replacement characters and common UTF-8-as-Latin-1/CP1252 artifacts are strong signals.
+    return suspicious / max(1, len(text))
+
+
+def recover_mojibake_lyrics(text):
+    """Try reversible common encoding repairs; return (candidate, changed, confidence)."""
+    if not text:
+        return text, False, 0.0
+    original_score = _lyric_garble_score(text)
+    candidates = [text]
+    # UTF-8 bytes misread as Latin-1 or Windows-1252, then decoded as UTF-8.
+    for enc in ("latin-1", "cp1252"):
+        try:
+            raw = text.encode(enc, errors="strict")
+            for dec in ("utf-8", "gb18030"):
+                try:
+                    candidates.append(raw.decode(dec, errors="strict"))
+                except (UnicodeDecodeError, LookupError):
+                    pass
+        except (UnicodeEncodeError, LookupError):
+            pass
+    # GBK/GB18030 text incorrectly decoded as UTF-8 replacement characters is not
+    # recoverable from replacement characters alone; skip risky guesses.
+    best = min(candidates, key=lambda x: (_lyric_garble_score(x), x.count("\ufffd")))
+    best_score = _lyric_garble_score(best)
+    if best != text and best_score < original_score and "\ufffd" not in best:
+        return best, True, max(0.0, original_score - best_score)
+    return text, False, 0.0
+
+
+def _normalize_match_text(value):
+    value = unicodedata.normalize("NFKC", str(value or "")).lower()
+    return re.sub(r"[^\w\u4e00-\u9fff]+", "", value)
+
+
+def find_lyric_source(target, directory_files):
+    """Fast sibling search: shortlist by filename before reading any audio tags."""
+    from difflib import SequenceMatcher
+    logger = logging.getLogger("MusicImporter")
+    target_stem = P(target).stem
+    target_norm = _normalize_match_text(target_stem)
+    target_tags = read_tags(target)
+    target_title = _normalize_match_text(target_tags.get("title") or target_stem)
+    target_artist = _normalize_match_text(target_tags.get("artist"))
+
+    # Name-only shortlist avoids opening every audio file's metadata in large folders.
+    shortlist = []
+    for candidate in directory_files:
+        if P(candidate).resolve() == P(target).resolve():
+            continue
+        cand_stem = P(candidate).stem
+        cand_norm = _normalize_match_text(cand_stem)
+        similarity = SequenceMatcher(None, target_norm, cand_norm).ratio() if target_norm and cand_norm else 0
+        exact_stem = cand_stem.casefold() == target_stem.casefold()
+        if exact_stem or (target_norm and cand_norm and (target_norm in cand_norm or cand_norm in target_norm)) or similarity >= 0.62:
+            shortlist.append((4 if exact_stem else similarity, candidate))
+    shortlist.sort(key=lambda x: x[0], reverse=True)
+    shortlist = shortlist[:12]
+    logger.info("LYRICS SOURCE SEARCH | target=%s | directory_audio=%d | shortlisted=%d", target, len(directory_files), len(shortlist))
+
+    ranked = []
+    for rank, candidate in shortlist:
+        logger.info("LYRICS SOURCE CANDIDATE | target=%s | candidate=%s | filename_score=%.3f", target, candidate, rank)
+        candidate_tags = read_tags(candidate)
+        title = _normalize_match_text(candidate_tags.get("title") or P(candidate).stem)
+        artist = _normalize_match_text(candidate_tags.get("artist"))
+        score = 0
+        if P(candidate).stem.lower() == P(target).stem.lower():
+            score += 4
+        if target_title and title == target_title:
+            score += 5
+        if target_artist and artist and artist == target_artist:
+            score += 3
+        if score >= 5:
+            lyrics = read_lyrics(candidate)
+            if lyrics:
+                ranked.append((score, candidate, lyrics))
+                logger.info("LYRICS SOURCE HAS TEXT | candidate=%s | score=%d | chars=%d", candidate, score, len(lyrics))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    if ranked and (len(ranked) == 1 or ranked[0][0] > ranked[1][0]):
+        logger.info("LYRICS SOURCE SELECTED | target=%s | source=%s | score=%d", target, ranked[0][1], ranked[0][0])
+        return ranked[0][1], ranked[0][2]
+    logger.info("LYRICS SOURCE NOT FOUND OR AMBIGUOUS | target=%s | matches=%d", target, len(ranked))
+    return None, ""
+
+
+
+def _strip_lrc_timestamps(text):
+    """Convert timestamped LRC into plain lyrics for embedded tag compatibility."""
+    lines = []
+    for line in (text or "").splitlines():
+        line = re.sub(r"\[(?:\d{1,2}:)?\d{1,2}:\d{2}(?:[.]\d{1,3})?\]", "", line)
+        line = re.sub(r"\[(?:ti|ar|al|by|re|ve|offset):[^]]*\]", "", line, flags=re.I)
+        if line.strip():
+            lines.append(line.strip())
+    return "\n".join(lines).strip()
+
+
+def _audio_duration_seconds(path):
+    try:
+        from mutagen import File as MutagenFile
+        audio = MutagenFile(str(path))
+        return float(audio.info.length) if audio and getattr(audio, "info", None) else None
+    except Exception:
+        return None
+
+
+def _lrclib_request_json(url, timeout=12):
+    """Request LRCLIB JSON with a descriptive user agent; safely handle HTTP errors."""
+    req = urllib.request.Request(url, headers={"User-Agent": "MusicImporter/1.0 (local music utility)"})
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8", errors="replace"))
+
+
+def _score_lrclib_candidate(candidate, title, artist, album, duration):
+    """Score search candidates using normalized metadata and duration; reject weak matches."""
+    from difflib import SequenceMatcher
+    ct = _normalize_match_text(candidate.get("trackName") or candidate.get("name") or "")
+    ca = _normalize_match_text(candidate.get("artistName") or "")
+    cal = _normalize_match_text(candidate.get("albumName") or "")
+    nt, na, nal = _normalize_match_text(title), _normalize_match_text(artist), _normalize_match_text(album)
+    title_ratio = SequenceMatcher(None, nt, ct).ratio() if nt and ct else 0.0
+    artist_ratio = SequenceMatcher(None, na, ca).ratio() if na and ca else 0.0
+    album_ratio = SequenceMatcher(None, nal, cal).ratio() if nal and cal else 0.0
+    candidate_duration = candidate.get("duration")
+    duration_delta = abs(float(candidate_duration) - float(duration)) if duration and candidate_duration else None
+    # Duration is a key version discriminator. Reject wildly different recordings.
+    if duration_delta is not None and duration_delta > max(12, float(duration) * 0.08):
+        return -1, (title_ratio, artist_ratio, album_ratio, duration_delta)
+    score = title_ratio * 5 + artist_ratio * 4 + album_ratio * 1.5
+    if duration_delta is not None:
+        score += max(0, 3 - duration_delta / 2)
+    return score, (title_ratio, artist_ratio, album_ratio, duration_delta)
+
+
+def fetch_lrclib_lyrics(path, timeout=12):
+    """Get lyrics using exact-signature first, then metadata search as a fallback."""
+    logger = logging.getLogger("MusicImporter")
+    tags = read_tags(path)
+    title = (tags.get("title") or P(path).stem).strip()
+    artist = (tags.get("artist") or "").strip()
+    album = (tags.get("album") or "").strip()
+    duration = _audio_duration_seconds(path)
+    if not title or not artist:
+        return None, None, "缺少歌名或歌手标签，跳过在线匹配"
+
+    base_params = {"track_name": title, "artist_name": artist}
+    if album:
+        base_params["album_name"] = album
+    if duration and 1 <= duration <= 3600:
+        base_params["duration"] = str(round(duration))
+
+    # 1) Exact signature endpoint (duration helps distinguish versions).
+    exact_url = "https://lrclib.net/api/get?" + urllib.parse.urlencode(base_params)
+    logger.info("LYRICS ONLINE EXACT REQUEST | title=%s | artist=%s | album=%s | duration=%s", title, artist, album, duration)
+    payload = None
+    exact_error = None
+    try:
+        payload = _lrclib_request_json(exact_url, timeout)
+        if not isinstance(payload, dict):
+            payload = None
+    except Exception as exc:
+        exact_error = str(exc)
+        logger.warning("LYRICS ONLINE EXACT FAILED | title=%s | reason=%s", title, exc)
+
+    # 2) Search endpoint fallback. Search candidates are ranked rather than trusting first result.
+    if not payload:
+        search_params = {"track_name": title, "artist_name": artist}
+        if album:
+            search_params["album_name"] = album
+        search_url = "https://lrclib.net/api/search?" + urllib.parse.urlencode(search_params)
+        logger.info("LYRICS ONLINE SEARCH REQUEST | title=%s | artist=%s", title, artist)
+        try:
+            candidates = _lrclib_request_json(search_url, timeout)
+            if isinstance(candidates, list):
+                ranked = []
+                for candidate in candidates:
+                    if not isinstance(candidate, dict):
+                        continue
+                    score, metrics = _score_lrclib_candidate(candidate, title, artist, album, duration)
+                    logger.info("LYRICS ONLINE CANDIDATE | title=%s | artist=%s | score=%.2f | metrics=%s | synced=%s | plain=%s",
+                                candidate.get("trackName"), candidate.get("artistName"), score, metrics,
+                                bool(candidate.get("syncedLyrics")), bool(candidate.get("plainLyrics")))
+                    if score >= 7.5 and metrics[0] >= 0.72 and metrics[1] >= 0.60:
+                        ranked.append((score, candidate))
+                ranked.sort(key=lambda x: x[0], reverse=True)
+                if ranked:
+                    payload = ranked[0][1]
+        except Exception as exc:
+            logger.warning("LYRICS ONLINE SEARCH FAILED | title=%s | reason=%s", title, exc)
+            if not exact_error:
+                exact_error = str(exc)
+
+    if not isinstance(payload, dict):
+        return None, None, f"在线匹配未找到可靠结果{('：' + exact_error) if exact_error else ''}"
+
+    matched_title = str(payload.get("trackName") or payload.get("name") or "")
+    matched_artist = str(payload.get("artistName") or "")
+    score, metrics = _score_lrclib_candidate(payload, title, artist, album, duration)
+    if score < 7.5 or metrics[0] < 0.72 or metrics[1] < 0.60:
+        logger.warning("LYRICS ONLINE REJECT | target=%s | match_title=%s | match_artist=%s | score=%.2f | metrics=%s", path, matched_title, matched_artist, score, metrics)
+        return None, None, f"匹配结果不可靠（{matched_title} / {matched_artist}），已拒绝写入"
+
+    synced = (payload.get("syncedLyrics") or "").strip()
+    plain = (payload.get("plainLyrics") or "").strip()
+    if synced and not plain:
+        plain = _strip_lrc_timestamps(synced)
+    if not plain and not synced:
+        return None, None, "匹配到歌曲，但该条目没有歌词内容"
+    logger.info("LYRICS ONLINE MATCH | title=%s | artist=%s | synced=%s | plain_chars=%d | synced_chars=%d | score=%.2f",
+                matched_title, matched_artist, bool(synced), len(plain), len(synced), score)
+    return plain or None, synced or None, {"title": matched_title, "artist": matched_artist, "album": payload.get("albumName", ""), "duration": payload.get("duration"), "score": score}
+
+def save_synced_lrc(path, synced):
+    """Write synced lyrics as a sibling .lrc sidecar without touching source audio."""
+    if not synced:
+        return None
+    lrc_path = str(P(path).with_suffix(".lrc"))
+    P(lrc_path).write_text(synced.rstrip() + "\n", encoding="utf-8")
+    return lrc_path
+
+def online_match_lyrics(target):
+    """Match lyrics online and immediately apply them to the selected audio file."""
+    logger = logging.getLogger("MusicImporter")
+    started = time.monotonic()
+    logger.info("LYRICS MATCH START | target=%s", target)
+    plain, synced, info = fetch_lrclib_lyrics(target)
+    if not plain and synced:
+        plain = _strip_lrc_timestamps(synced)
+    if not plain:
+        detail = info if isinstance(info, str) else "匹配结果没有可写入的歌词"
+        logger.info("LYRICS MATCH RESULT | target=%s | result=not-found | detail=%s", target, detail)
+        return False, detail
+    if not write_lyrics(target, plain):
+        logger.error("LYRICS MATCH WRITE FAILED | target=%s", target)
+        return False, "匹配到歌词，但写入音频标签失败"
+    lrc_path = save_synced_lrc(target, synced) if synced else None
+    matched = info if isinstance(info, dict) else {}
+    detail = f"匹配成功并已写入：{matched.get('title', '')} / {matched.get('artist', '')}"
+    if lrc_path:
+        detail += f"；同步歌词保存为 {P(lrc_path).name}"
+    else:
+        detail += "；未提供同步时间轴"
+    logger.info("LYRICS MATCH DONE | target=%s | title=%s | artist=%s | synced=%s | elapsed=%.2fs",
+                target, matched.get("title", ""), matched.get("artist", ""), bool(synced), time.monotonic()-started)
+    return True, detail
 
 
 def normalize_track_number(raw):
@@ -233,6 +612,13 @@ class MusicImporter:
         root.minsize(900, 580)
 
         self.ffmpeg = find_ffmpeg()
+        if self.ffmpeg:
+            try:
+                probe = subprocess.run([self.ffmpeg, "-hide_banner", "-version"], capture_output=True, text=True, timeout=15)
+                logging.getLogger("MusicImporter").info("FFmpeg version/build output:\n%s", (probe.stdout or probe.stderr)[:12000])
+                logging.getLogger("MusicImporter").info("FFmpeg version probe exit code=%s", probe.returncode)
+            except Exception:
+                logging.getLogger("MusicImporter").exception("FFmpeg version probe failed")
         self.output_dir = str(P.home() / "Music" / "MusicImporter")
         self.output_dir_customized = False
         self.output_format = tk.StringVar(value="ALAC")
@@ -325,10 +711,11 @@ class MusicImporter:
         self.add_menu_button.pack(fill="x", padx=10, pady=4)
         ttk.Button(rail, text="⌫  移除选中项目", command=self.remove_selected).pack(fill="x", padx=10, pady=4)
         self.tools_menu_button = ttk.Button(rail, text="标签与封面工具  ▾", command=lambda: self._show_action_menu(self.tools_menu_button, [
-            ("歌名智能清理…", self.preview_cleanup), ("批量编辑信息…", self.batch_edit),
-            ("编辑单曲标签…", self.edit_one), ("设置专辑封面…", self.set_artwork)]), style="TButton")
+            ("歌名智能清理…", self.preview_cleanup), ("批量编辑信息…", self.batch_edit)]), style="TButton")
         self.tools_menu_button.pack(fill="x", padx=10, pady=4)
         ttk.Button(rail, text="拆分预览 / 编辑曲目", command=self.preview_split_tracks, style="Accent.TButton").pack(fill="x", padx=10, pady=4)
+        self.lyrics_match_button = ttk.Button(rail, text="在线匹配歌词", command=self.match_selected_lyrics, style="Accent.TButton")
+        self.lyrics_match_button.pack(fill="x", padx=10, pady=4)
 
         table_panel = tk.Frame(workarea, bg=c["panel"], highlightbackground=c["line"], highlightthickness=1)
         table_panel.pack(side="left", fill="both", expand=True)
@@ -350,6 +737,14 @@ class MusicImporter:
         tree_y.pack(side="right", fill="y", padx=(0, 8), pady=(0, 10))
         tree_x.pack(side="bottom", fill="x", padx=(10, 0), pady=(0, 8))
         self.tree.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=(0, 10))
+        # Double-click a row in the main library to edit its metadata directly.
+        def on_track_double_click(event):
+            row = self.tree.identify_row(event.y)
+            if not row:
+                return
+            self.tree.selection_set(row)
+            self.edit_one()
+        self.tree.bind("<Double-Button-1>", on_track_double_click)
         self.tree.tag_configure("odd", background=c["panel2"])
         self.tree.tag_configure("even", background=c["panel"])
 
@@ -379,7 +774,7 @@ class MusicImporter:
         self.split_convert_button.pack(side="left", fill="x", expand=True, padx=6)
         self.convert_button = ttk.Button(action_row, text="格式转换", command=lambda: self.start_work("convert"), style="Accent.TButton")
         self.convert_button.pack(side="left", fill="x", expand=True, padx=6)
-        self.action_buttons.extend([self.split_button, self.split_convert_button, self.convert_button])
+        self.action_buttons.extend([self.split_button, self.split_convert_button, self.convert_button, self.lyrics_match_button])
         self.stop_button = ttk.Button(action_row, text="停止任务", command=self.stop_work, state="disabled", style="Danger.TButton")
         self.stop_button.pack(side="left", fill="x", expand=True, padx=(6, 0))
         # Apple Music auto-add is a secondary preference, housed in the output settings menu.
@@ -537,9 +932,10 @@ class MusicImporter:
         if not folder:
             return
         paths = [str(p) for p in P(folder).rglob("*") if p.is_file() and (p.suffix.lower() in SUPPORTED or p.suffix.lower() == ".cue")]
-        self.add_paths(paths)
+        # Keep artwork lookup inside the folder explicitly selected by the user.
+        self.add_paths(paths, artwork_root=folder)
 
-    def add_paths(self, paths):
+    def add_paths(self, paths, artwork_root=None):
         # CUE files are auxiliary split metadata; associate them with audio by basename and folder.
         audio_paths = []
         cue_paths = []
@@ -585,10 +981,14 @@ class MusicImporter:
             match = TRACK_PREFIX.match(P(path).stem)
             if not tags["tracknumber"] and match:
                 tags["tracknumber"] = normalize_track_number(match.group(1) or match.group(2))
-            artwork = self.find_folder_artwork(path)
+            # Prefer a cover image found beside this track by default. Searching
+            # is performed per audio file's own directory, so nested album folders
+            # keep their local artwork instead of inheriting the parent folder's.
+            folder_cover = self.find_folder_artwork(path, search_root=artwork_root or P(path).parent)
             self.items.append({
                 "source": path, "tags": tags, "output": None, "status": "待转换",
-                "artwork": artwork, "artwork_source": "文件夹自动识别" if artwork else "待检查"
+                "artwork": folder_cover,
+                "artwork_source": f"自动识别：{P(folder_cover).name}" if folder_cover else "未找到外部封面（保留内嵌封面）"
             })
             existing.add(path)
         self.refresh()
@@ -601,7 +1001,7 @@ class MusicImporter:
                 P(item["source"]).name, t["title"], t["artist"], t["album"],
                 t["albumartist"], t["date"], t["tracknumber"],
                 self._audio_quality_badge(item["source"]),
-                ("有：" + P(item["artwork"]).name if item.get("artwork") else "未识别"),
+                ("有：" + P(item["artwork"]).name if item.get("artwork") else "保留内嵌"),
                 item["status"]
             ), tags=("odd" if idx % 2 else "even",))
 
@@ -667,7 +1067,7 @@ class MusicImporter:
             messagebox.showinfo("提示", "请先选中需要批量修改的歌曲。")
             return
         win = tk.Toplevel(self.root)
-        self._prepare_popup(win, "批量编辑歌曲信息", "460x330")
+        self._prepare_popup(win, "批量编辑歌曲信息", "520x390")
         body = self._popup_body(win, 14)
 
         editable = [
@@ -686,12 +1086,44 @@ class MusicImporter:
             entry.pack(side="left", fill="x", expand=True)
             entries[key] = entry
 
+        # Collect image choices from folders represented by the selected tracks.
+        # Empty choice means no external cover: keep embedded source art only.
+        image_exts = {".jpg", ".jpeg", ".png", ".webp"}
+        folder_images = {}
+        for idx in indices:
+            folder = P(self.items[idx]["source"]).parent
+            try:
+                for image_file in folder.iterdir():
+                    if image_file.is_file() and image_file.suffix.lower() in image_exts:
+                        folder_images[str(image_file)] = image_file.name
+            except OSError:
+                pass
+        cover_choices = [""] + sorted(folder_images.keys(), key=lambda x: (folder_images[x].lower(), x.lower()))
+        cover_frame = ttk.Frame(body, style="Popup.TFrame")
+        cover_frame.pack(fill="x", pady=(10, 4))
+        ttk.Label(cover_frame, text="批量封面", width=20, style="Popup.TLabel").pack(side="left")
+        cover_var = tk.StringVar(value="")
+        cover_combo = ttk.Combobox(cover_frame, state="readonly", values=["（不指定封面）"] + [folder_images[x] for x in cover_choices[1:]], textvariable=cover_var)
+        cover_combo.pack(side="left", fill="x", expand=True)
+        cover_combo.current(0)
+        cover_choice_map = {"（不指定封面）": ""}
+        for path in cover_choices[1:]:
+            # Disambiguate same-named images in different folders in dropdown.
+            display = folder_images[path]
+            if display in cover_choice_map:
+                display = f"{display} · {P(path).parent.name}"
+            cover_choice_map[display] = path
+        cover_combo.configure(values=list(cover_choice_map.keys()))
+
         def apply():
             values = {k: e.get().strip() for k, e in entries.items()}
+            chosen_cover = cover_choice_map.get(cover_var.get(), "")
             for idx in indices:
                 for key, val in values.items():
                     if val:
                         self.items[idx]["tags"][key] = val
+                self.items[idx]["artwork"] = chosen_cover or None
+                self.items[idx]["artwork_source"] = "批量指定" if chosen_cover else "未指定（保留内嵌封面）"
             self.refresh()
             win.destroy()
 
@@ -724,38 +1156,156 @@ class MusicImporter:
         body.columnconfigure(1, weight=1)
         ttk.Button(body, text="保存", command=save, style="PopupAccent.TButton").grid(row=len(TAG_FIELDS), column=1, pady=(14, 0), sticky="e")
 
-    def find_folder_artwork(self, audio_path):
-        """Detect common cover-art filenames next to a source audio file."""
-        folder = P(audio_path).parent
-        preferred = ["cover.jpg", "cover.jpeg", "folder.jpg", "folder.jpeg",
-                     "album.jpg", "album.jpeg", "front.jpg", "front.jpeg",
-                     "cover.png", "folder.png", "album.png", "front.png",
-                     "cover.webp", "folder.webp", "album.webp", "front.webp"]
-        file_map = {p.name.lower(): p for p in folder.iterdir() if p.is_file()}
-        for name in preferred:
-            if name.lower() in file_map:
-                return str(file_map[name.lower()])
-        images = [p for p in folder.iterdir() if p.is_file()
-                  and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}]
-        if len(images) == 1:
-            return str(images[0])
+    def find_folder_artwork(self, audio_path, search_root=None):
+        """Find artwork beside a track, searching upward only within search_root.
+
+        This supports layouts such as:
+            Neon/
+              cover.png
+              CD1/track01.flac
+              CD2/track02.flac
+
+        Artwork in the track's own directory always wins. Parent folders are
+        checked only as a fallback, so a CD-specific cover is not overridden
+        by a collection-level cover.
+        """
+        supported_images = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
+        name_priority = ["cover", "folder", "front", "album", "albumart", "album_art",
+                         "artwork", "art", "coverart", "cover_art", "scan", "image"]
+
+        def choose_in_folder(folder):
+            try:
+                folder_files = [
+                    p for p in folder.iterdir()
+                    if p.is_file() and p.suffix.lower() in supported_images
+                ]
+            except OSError:
+                return None
+            if not folder_files:
+                return None
+
+            by_stem = {}
+            for image in folder_files:
+                by_stem.setdefault(image.stem.casefold(), []).append(image)
+            for stem in name_priority:
+                if stem in by_stem:
+                    return str(sorted(by_stem[stem], key=lambda p: p.suffix.lower())[0])
+
+            semantic = []
+            for image in folder_files:
+                low = image.stem.casefold().replace("-", " ").replace("_", " ")
+                if any(word in low for word in ("cover", "folder", "front", "album", "artwork", "coverart")):
+                    semantic.append(image)
+            if semantic:
+                semantic.sort(key=lambda p: (
+                    next((i for i, word in enumerate(name_priority) if word in p.stem.casefold()), 99),
+                    p.name.casefold()
+                ))
+                return str(semantic[0])
+
+            if len(folder_files) == 1:
+                return str(folder_files[0])
+            try:
+                from PIL import Image
+                ranked = []
+                for image in folder_files:
+                    try:
+                        with Image.open(image) as im:
+                            ranked.append((im.width * im.height, image.name.casefold(), image))
+                    except Exception:
+                        continue
+                if ranked:
+                    ranked.sort(key=lambda x: (-x[0], x[1]))
+                    return str(ranked[0][2])
+            except Exception:
+                pass
+            return None
+
+        track_folder = P(audio_path).resolve().parent
+        boundary = P(search_root).resolve() if search_root else track_folder
+
+        # Refuse to search outside the selected root. If the audio file is not
+        # actually inside that root (for example, a stale path), fall back to
+        # its own directory rather than traversing unrelated parent folders.
+        try:
+            track_folder.relative_to(boundary)
+        except ValueError:
+            boundary = track_folder
+
+        folder = track_folder
+        while True:
+            found = choose_in_folder(folder)
+            if found:
+                return found
+            if folder == boundary:
+                break
+            parent = folder.parent
+            if parent == folder:
+                break
+            try:
+                parent.relative_to(boundary)
+            except ValueError:
+                break
+            folder = parent
         return None
 
-    def set_artwork(self):
-        indices = self.selected_indices()
-        if not indices:
-            messagebox.showinfo("设置封面", "请先选中歌曲。")
-            return
-        image_path = filedialog.askopenfilename(
-            title="选择专辑封面",
-            filetypes=[("图片", "*.jpg *.jpeg *.png *.webp"), ("所有文件", "*.*")]
-        )
-        if not image_path:
-            return
-        for idx in indices:
-            self.items[idx]["artwork"] = image_path
-            self.items[idx]["artwork_source"] = "手动指定"
-        self.refresh()
+    def extract_embedded_artwork(self, audio_path, destination_dir=None):
+        """Extract the first embedded source image to a temporary JPEG/PNG file.
+        Returns None if the audio has no embedded artwork or extraction fails.
+        Caller is responsible for removing the returned temporary file.
+        """
+        try:
+            from mutagen import File as MutagenFile
+            from mutagen.id3 import APIC
+            from mutagen.mp4 import MP4
+            from mutagen.flac import FLAC
+            from mutagen.oggvorbis import OggVorbis
+            from mutagen.oggopus import OggOpus
+            from mutagen.oggflac import OggFLAC
+            audio = MutagenFile(str(audio_path))
+            image_data = None
+            image_ext = ".jpg"
+            if audio is None:
+                return None
+            # ID3 (MP3/AIFF), MP4/M4A, FLAC picture blocks, and Vorbis-family
+            # picture metadata are handled without relying on FFmpeg stream maps.
+            tags = getattr(audio, "tags", None)
+            if tags:
+                for tag in tags.values():
+                    if isinstance(tag, APIC):
+                        image_data = tag.data
+                        image_ext = ".jpg" if "jpeg" in (tag.mime or "").lower() else ".png"
+                        break
+                if image_data is None and "covr" in tags:
+                    covr = tags["covr"]
+                    if covr:
+                        image_data = bytes(covr[0])
+                        image_ext = ".jpg" if getattr(covr[0], "imageformat", 0) == 13 else ".png"
+                if image_data is None and hasattr(audio, "pictures") and audio.pictures:
+                    pic = audio.pictures[0]
+                    image_data = pic.data
+                    image_ext = ".jpg" if "jpeg" in (pic.mime or "").lower() else ".png"
+                if image_data is None:
+                    encoded = tags.get("metadata_block_picture") or tags.get("coverart")
+                    if encoded:
+                        import base64
+                        from mutagen.flac import Picture
+                        raw = base64.b64decode(encoded[0]) if isinstance(encoded[0], str) else encoded[0]
+                        pic = Picture(raw) if isinstance(raw, bytes) and raw.startswith(b"\x00\x00\x00") else None
+                        if pic:
+                            image_data = pic.data
+                            image_ext = ".jpg" if "jpeg" in (pic.mime or "").lower() else ".png"
+            if not image_data:
+                return None
+            import tempfile
+            folder = destination_dir or tempfile.gettempdir()
+            fd, out_path = tempfile.mkstemp(prefix="musicimporter_embedded_", suffix=image_ext, dir=folder)
+            with os.fdopen(fd, "wb") as f:
+                f.write(image_data)
+            return out_path
+        except Exception:
+            logging.getLogger("MusicImporter").exception("EMBEDDED ARTWORK EXTRACT FAILED | source=%s", audio_path)
+            return None
 
     def choose_format(self):
         """Compact output-format selector, matching the application's light theme."""
@@ -934,8 +1484,14 @@ class MusicImporter:
             return audio, info, tracks, "CUE"
         # Without CUE, use silence detection as an estimate. The status remains visible in the main window.
         self.set_status(f"检测静音分段：{P(audio).name}")
-        proc = subprocess.run([self.ffmpeg, "-hide_banner", "-i", audio,
-            "-af", "silencedetect=noise=-35dB:d=1.5", "-f", "null", "-"], capture_output=True, text=True)
+        silence_cmd = [self.ffmpeg, "-hide_banner", "-i", audio, "-af", "silencedetect=noise=-35dB:d=1.5", "-f", "null", "-"]
+        logger = logging.getLogger("MusicImporter")
+        logger.info("SILENCE DETECTION START | source=%s | command=%s", audio, shlex.join(silence_cmd))
+        silence_started = time.monotonic()
+        proc = subprocess.run(silence_cmd, capture_output=True, text=True)
+        logger.info("SILENCE DETECTION END | source=%s | exit=%s | elapsed=%.3f sec", audio, proc.returncode, time.monotonic() - silence_started)
+        if proc.stderr:
+            logger.info("SILENCE DETECTION STDERR (last 5000 chars):\n%s", proc.stderr[-5000:])
         log = proc.stderr
         duration = self._audio_duration(audio)
         silence_starts = [float(x) for x in re.findall(r"silence_start:\s*([0-9.]+)", log)]
@@ -951,18 +1507,27 @@ class MusicImporter:
         return audio, {"album": item["tags"].get("album") or P(audio).stem, "artist": item["tags"].get("albumartist") or item["tags"].get("artist", "")}, tracks, "静音检测估算"
 
     def _audio_duration(self, audio):
+        logger = logging.getLogger("MusicImporter")
+        logger.info("AUDIO DURATION PROBE | source=%s | command=%s", audio, shlex.join([self.ffmpeg, "-i", audio]))
+        started = time.monotonic()
         proc = subprocess.run([self.ffmpeg, "-i", audio], capture_output=True, text=True)
+        logger.info("AUDIO DURATION PROBE END | source=%s | exit=%s | elapsed=%.3f sec", audio, proc.returncode, time.monotonic() - started)
+        if proc.stderr:
+            logger.info("AUDIO DURATION PROBE STDERR (last 4000 chars):\n%s", proc.stderr[-4000:])
         dm = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", proc.stderr)
         if not dm: raise RuntimeError("无法读取音频时长")
         h, m, sec = dm.groups(); return int(h)*3600 + int(m)*60 + float(sec)
 
     def _run_cancellable_process(self, cmd, timeout=None):
-        """Run a child process while allowing the UI stop button to terminate it."""
+        """Run a child process while allowing the UI stop button to terminate it; log timing and diagnostics."""
+        logger = logging.getLogger("MusicImporter")
         if self.cancel_requested.is_set():
             raise InterruptedError("任务已取消")
+        logger.info("SUBPROCESS START | timeout=%s | command=%s", timeout, shlex.join([str(x) for x in cmd]))
+        started = time.monotonic()
+        wall_started = time.time()
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.current_process = proc
-        started = __import__("time").monotonic()
         try:
             while proc.poll() is None:
                 if self.cancel_requested.is_set():
@@ -984,9 +1549,18 @@ class MusicImporter:
                     continue
             else:
                 out, err = proc.communicate()
+            elapsed = time.monotonic() - started
+            logger.info("SUBPROCESS END | exit_code=%s | elapsed=%.3f sec | started_epoch=%.3f", proc.returncode, elapsed, wall_started)
+            if err:
+                logger.info("SUBPROCESS STDERR (last 12000 chars):\n%s", err[-12000:])
+            if out:
+                logger.info("SUBPROCESS STDOUT (last 3000 chars):\n%s", out[-3000:])
             if self.cancel_requested.is_set():
                 raise InterruptedError("任务已取消")
             return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+        except Exception:
+            logger.exception("SUBPROCESS FAILED | command=%s", shlex.join([str(x) for x in cmd]))
+            raise
         finally:
             self.current_process = None
 
@@ -1063,6 +1637,7 @@ class MusicImporter:
             src = item["source"]
             self.root.after(0, lambda i=idx: self.items[i].update(status="处理中"))
             self.root.after(0, self.refresh)
+            embedded_temp_cover = None
             try:
                 if split_enabled:
                     task_generated = []
@@ -1091,7 +1666,11 @@ class MusicImporter:
                             self.set_status(f"{P(src).suffix.upper()} 不支持直接分段输出，改为 FLAC：{P(src).name}")
                     album = safe_component(item["tags"].get("album") or info.get("album") or P(audio).stem, P(audio).stem)
                     album_artist = item["tags"].get("albumartist") or item["tags"].get("artist") or info.get("artist", "")
-                    cover = item.get("artwork") or self.find_folder_artwork(audio)
+                    cover = item.get("artwork")
+                    embedded_temp_cover = None
+                    if not cover:
+                        embedded_temp_cover = self.extract_embedded_artwork(audio)
+                        cover = embedded_temp_cover
                     date = item["tags"].get("date", "")
                     # v14: segment the complete album in one FFmpeg invocation.
                     # Stage all files outside the final output folder so cancellation/failure
@@ -1152,8 +1731,6 @@ class MusicImporter:
                             task_generated.append(str(dest))
                     generated_files.extend(task_generated)
                     self.root.after(0, lambda i=idx: self.items[i].update(status=f"拆分完成 ({mode})"))
-                    generated_files.extend(task_generated)
-                    self.root.after(0, lambda i=idx: self.items[i].update(status=f"拆分完成 ({mode})"))
                 else:
                     # Standard format conversion: reuse existing conversion worker on selected items only.
                     self.convert_single_item(item, fmt)
@@ -1168,6 +1745,10 @@ class MusicImporter:
             except Exception as exc:
                 failures.append(f"{P(src).name}: {exc}")
                 self.root.after(0, lambda i=idx: self.items[i].update(status="失败"))
+            finally:
+                if embedded_temp_cover:
+                    try: P(embedded_temp_cover).unlink()
+                    except OSError: pass
             self.root.after(0, self.refresh)
             self.root.after(0, lambda v=n: self.progress.configure(value=v))
             self.set_status(f"任务进度 {n}/{len(selected)} · 成功 {successes} · 失败 {len(failures)}")
@@ -1182,15 +1763,25 @@ class MusicImporter:
                 import_summary += "\n导入错误：\n" + "\n".join(import_failures[:5])
         cancelled = self.cancel_requested.is_set()
         self.busy=False
-        self.root.after(0, lambda: [button.configure(state="normal") for button in self.action_buttons])
-        self.root.after(0, lambda: self.stop_button.configure(state="disabled"))
-        msg=("任务已取消" if cancelled else "任务完成") + f"\n完成 {successes} 个任务 · 失败 {len(failures)}" + import_summary
-        if failures: msg += "\n\n" + "\n".join(failures[:5])
-        if not self.closing_requested:
-            self.root.after(0, lambda: messagebox.showinfo("任务结果", msg))
-        self.set_status(("任务已取消" if cancelled else "任务完成") + f"：成功 {successes} · 失败 {len(failures)}")
-        if self.closing_requested:
-            self.root.after(0, self.root.destroy)
+        # Generated files stay in the output directory and are not added to the
+        # main source list. Lyrics matched on the source are explicitly copied by
+        # convert_single_item() into converted outputs, so there is no need to
+        # load those outputs back into the UI.
+        def finish_work_ui():
+            for button in self.action_buttons:
+                button.configure(state="normal")
+            self.stop_button.configure(state="disabled")
+            msg=("任务已取消" if cancelled else "任务完成") + f"\n完成 {successes} 个任务 · 失败 {len(failures)}"
+            if generated_files and not cancelled:
+                msg += f"\n输出文件已保存到设置的目录。原文件匹配的歌词会随格式转换写入输出文件。"
+            msg += import_summary
+            if failures: msg += "\n\n" + "\n".join(failures[:5])
+            if not self.closing_requested:
+                messagebox.showinfo("任务结果", msg)
+            self.status.config(text=("任务已取消" if cancelled else "任务完成") + f"：成功 {successes} · 失败 {len(failures)}")
+            if self.closing_requested:
+                self.root.destroy()
+        self.root.after(0, finish_work_ui)
 
     def _format_spec(self, fmt):
         return {"ALAC":("m4a",["-c:a","alac"]),"FLAC":("flac",["-c:a","flac"]),
@@ -1227,8 +1818,60 @@ class MusicImporter:
         # output muxer in common builds. Split them into FLAC rather than failing.
         return ("flac", ["-c:a", "flac"]), True
 
+    def match_selected_lyrics(self):
+        """Online-match lyrics for selected tracks and write matches directly into their tags."""
+        if self.busy:
+            messagebox.showinfo("任务进行中", "请等当前转换任务结束后再匹配歌词。")
+            return
+        selected = self.selected_indices()
+        if not selected:
+            messagebox.showinfo("提示", "请先在主界面选中要匹配歌词的歌曲。")
+            return
+        targets = [self.items[i]["source"] for i in selected]
+        self.busy = True
+        for button in self.action_buttons:
+            button.configure(state="disabled")
+        self.set_status(f"开始在线匹配歌词：{len(targets)} 首…")
+        logger = logging.getLogger("MusicImporter")
+        logger.info("LYRICS MATCH BATCH START | count=%d", len(targets))
+
+        def worker():
+            matched = 0
+            failed = []
+            details = []
+            for n, target in enumerate(targets, 1):
+                self.root.after(0, lambda i=n, t=target: self.set_status(f"在线匹配歌词 {i}/{len(targets)}：{P(t).name}"))
+                try:
+                    ok, detail = online_match_lyrics(target)
+                    if ok:
+                        matched += 1
+                    else:
+                        failed.append(P(target).name)
+                    details.append(f"{P(target).name}：{detail}")
+                except Exception as exc:
+                    failed.append(P(target).name)
+                    details.append(f"{P(target).name}：匹配失败 - {exc}")
+                    logger.exception("LYRICS MATCH ITEM ERROR | target=%s", target)
+            summary = f"在线歌词匹配完成：成功 {matched}/{len(targets)} 首；未匹配/失败 {len(failed)} 首。"
+            report = summary + "\n\n" + "\n".join(details)
+            logger.info("LYRICS MATCH BATCH END | success=%d | failed=%d", matched, len(failed))
+            def finish():
+                self.busy = False
+                for button in self.action_buttons:
+                    button.configure(state="normal")
+                self.set_status(summary)
+                messagebox.showinfo("在线匹配歌词", report)
+            self.root.after(0, finish)
+        threading.Thread(target=worker, daemon=True, name="LyricsOnlineMatch").start()
+
     def _write_track_metadata(self, path, title, artist, album, album_artist, track, date, genre, disc, cover):
         """Best-effort cross-format tags and artwork using Mutagen after batch splitting."""
+        logger = logging.getLogger("MusicImporter")
+        started = time.monotonic()
+        logger.info("METADATA/ARTWORK START | file=%s | title=%s | cover=%s", path, title, cover)
+        log_file_info("STAGED TRACK BEFORE TAGGING", path)
+        if cover:
+            log_file_info("METADATA COVER", cover)
         from mutagen import File as MutagenFile
         audio = MutagenFile(str(path))
         if audio is None:
@@ -1267,10 +1910,76 @@ class MusicImporter:
                     m = MP4(path); fmt = MP4Cover.FORMAT_JPEG if P(cover).suffix.lower() in {".jpg", ".jpeg"} else MP4Cover.FORMAT_PNG; m.tags["covr"] = [MP4Cover(P(cover).read_bytes(), imageformat=fmt)]; m.save()
             except Exception as e:
                 # Cover embedding is non-fatal for formats where Mutagen lacks support.
+                logger.exception("METADATA COVER EMBEDDING FAILED | file=%s | cover=%s", path, cover)
                 self.set_status(f"封面写入未完成：{P(path).name}（{e}）")
+        logger.info("METADATA/ARTWORK END | file=%s | elapsed=%.3f sec", path, time.monotonic() - started)
+        log_file_info("STAGED TRACK AFTER TAGGING", path)
+
+    def _embed_conversion_artwork(self, output_path, cover_path):
+        """Embed artwork; normalize uncommon image formats to JPEG for compatibility."""
+        ext = P(output_path).suffix.lower()
+        cover = P(cover_path)
+        image_ext = cover.suffix.lower()
+        temp_jpeg = None
+        if image_ext not in {".jpg", ".jpeg", ".png"}:
+            temp_jpeg = P(output_path).with_name(P(output_path).stem + ".cover-normalized-temp.jpg")
+            proc = subprocess.run([self.ffmpeg, "-nostdin", "-y", "-i", str(cover), "-frames:v", "1", str(temp_jpeg)],
+                                  capture_output=True, text=True, timeout=60)
+            if proc.returncode != 0 or not temp_jpeg.exists() or not temp_jpeg.stat().st_size:
+                raise RuntimeError("封面图片格式无法转换为兼容格式：" + (proc.stderr[-1000:] if proc.stderr else "未知错误"))
+            cover = temp_jpeg
+            image_ext = ".jpg"
+        data = cover.read_bytes()
+        mime = "image/jpeg" if image_ext in {".jpg", ".jpeg"} else "image/png"
+        try:
+            if ext == ".flac":
+                from mutagen.flac import FLAC, Picture
+                audio = FLAC(output_path)
+                picture = Picture(); picture.type = 3; picture.mime = mime; picture.desc = "Cover"; picture.data = data
+                audio.clear_pictures(); audio.add_picture(picture); audio.save(); return
+            if ext in {".mp3", ".aiff", ".aif"}:
+                from mutagen.id3 import ID3, APIC, ID3NoHeaderError
+                try: audio = ID3(output_path)
+                except ID3NoHeaderError: audio = ID3()
+                audio.delall("APIC"); audio.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=data))
+                audio.save(output_path); return
+            if ext == ".m4a":
+                from mutagen.mp4 import MP4, MP4Cover
+                audio = MP4(output_path)
+                image_format = MP4Cover.FORMAT_JPEG if image_ext in {".jpg", ".jpeg"} else MP4Cover.FORMAT_PNG
+                audio.tags["covr"] = [MP4Cover(data, imageformat=image_format)]; audio.save(); return
+            if ext in {".wav", ".wave"}:
+                from mutagen.wave import WAVE
+                from mutagen.id3 import APIC
+                audio = WAVE(output_path)
+                if audio.tags is None: audio.add_tags()
+                audio.tags.delall("APIC"); audio.tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=data))
+                audio.save(); return
+            if ext in {".opus", ".ogg"}:
+                from mutagen.oggopus import OggOpus
+                from mutagen.oggvorbis import OggVorbis
+                from mutagen.flac import Picture
+                audio = OggOpus(output_path) if ext == ".opus" else OggVorbis(output_path)
+                picture = Picture(); picture.type = 3; picture.mime = mime; picture.desc = "Cover"; picture.data = data
+                audio["metadata_block_picture"] = [picture.write().hex()]; audio.save(); return
+            if ext == ".wv":
+                from mutagen import File as MutagenFile
+                from mutagen.flac import Picture
+                audio = MutagenFile(output_path)
+                if audio is None: raise RuntimeError("无法打开 WavPack 输出文件写入封面")
+                picture = Picture(); picture.type = 3; picture.mime = mime; picture.desc = "Cover"; picture.data = data
+                audio["metadata_block_picture"] = [picture.write().hex()]; audio.save(); return
+            raise RuntimeError(f"当前输出格式不支持封面写入：{ext}")
+        finally:
+            if temp_jpeg:
+                try: temp_jpeg.unlink()
+                except OSError: pass
 
     def convert_single_item(self, item, fmt):
         src=item["source"]; tags=item["tags"]
+        logger = logging.getLogger("MusicImporter")
+        logger.info("CONVERSION REQUEST | format=%s | source=%s | tags=%s", fmt, src, tags)
+        log_file_info("SOURCE", src)
         ext,codec=self._format_spec(fmt)
         out_dir=P(self.output_dir)/safe_component(tags.get("album"),"Unknown Album"); out_dir.mkdir(parents=True,exist_ok=True)
         out=out_dir/(safe_component(tags.get("title"),P(src).stem)+"."+ext)
@@ -1279,33 +1988,71 @@ class MusicImporter:
             while (out_dir/(safe_component(tags.get("title"),P(src).stem)+f" ({suffix})."+ext)).exists(): suffix+=1
             out=out_dir/(safe_component(tags.get("title"),P(src).stem)+f" ({suffix})."+ext)
         art=item.get("artwork")
-        embed_cover=bool(art and os.path.isfile(art) and ext in {"m4a","flac","mp3","aiff"})
-        # Declare all inputs before output-side mapping and codec options (FFmpeg option-order requirement).
-        cmd=[self.ffmpeg,"-nostdin","-y","-i",src]
+        embedded_temp_cover = None
+        if not art:
+            embedded_temp_cover = self.extract_embedded_artwork(src)
+            art = embedded_temp_cover
+        embed_cover=bool(art and os.path.isfile(art) and ext in {"m4a", "flac", "mp3", "aiff", "wav", "opus", "ogg", "wv"})
+        logger.info("CONVERSION OPTIONS | target=%s | output=%s | output_format=%s | codec=%s | cover=%s | cover_embedded_after_audio_conversion=%s", fmt, out, ext, codec, art, embed_cover)
         if embed_cover:
-            cmd += ["-loop", "1", "-i",art]
-        cmd += ["-map","0:a:0",*codec,"-map_metadata","0"]
-        if embed_cover:
-            cmd += ["-map","1:v:0","-c:v","mjpeg","-disposition:v","attached_pic","-shortest"]
-        elif ext not in {"wav","opus"}:
-            cmd += ["-map","0:v?","-c:v","copy","-disposition:v","attached_pic"]
+            log_file_info("COVER INPUT", art)
+        # Convert audio only. Do NOT feed the artwork to FFmpeg as a looping video
+        # stream: that path encodes thousands of MJPEG frames and can make a song
+        # conversion take nearly its full playback duration.
+        cmd=[self.ffmpeg,"-nostdin","-y","-i",src,"-map","0:a:0",*codec,"-map_metadata","0"]
         for key,val in [("title","title"),("artist","artist"),("album","album"),("album_artist","albumartist"),("date","date"),("genre","genre"),("track","tracknumber"),("disc","discnumber")]:
             cmd += ["-metadata",f"{key}={tags.get(val,'')}"]
         cmd.append(str(out))
+        # Lyrics are handled separately from FFmpeg metadata mapping because
+        # cross-container lyric-tag mapping can omit or alter text.
+        lyrics = read_lyrics(src)
+        logger.info("LYRICS SOURCE | source=%s | present=%s | chars=%d", src, bool(lyrics), len(lyrics))
+        conversion_started = time.monotonic()
         try:
             pr=self._run_cancellable_process(cmd, timeout=6*60*60)
         except InterruptedError:
+            logger.warning("CONVERSION CANCELLED | source=%s | elapsed=%.3f sec", src, time.monotonic() - conversion_started)
             try:
                 if out.exists(): out.unlink()
             except OSError: pass
+            if embedded_temp_cover:
+                try: P(embedded_temp_cover).unlink()
+                except OSError: pass
             raise
         if pr.returncode != 0 or not out.exists() or not out.stat().st_size:
+            logger.error("CONVERSION INVALID OUTPUT | source=%s | exit_code=%s | output_exists=%s", src, pr.returncode, out.exists())
             try:
                 if out.exists(): out.unlink()
             except OSError: pass
+            if embedded_temp_cover:
+                try: P(embedded_temp_cover).unlink()
+                except OSError: pass
             if self.cancel_requested.is_set(): raise InterruptedError("任务已取消")
             raise RuntimeError(pr.stderr[-600:])
+        # Embed artwork with Mutagen after audio conversion. This writes a single
+        # static cover image to the container/tag, rather than encoding image
+        # frames alongside the entire audio stream.
+        if embed_cover:
+            try:
+                self._embed_conversion_artwork(str(out), art)
+                logger.info("CONVERSION COVER EMBEDDED | output=%s | cover=%s", out, art)
+            except Exception:
+                logger.exception("CONVERSION COVER EMBEDDING FAILED | output=%s | cover=%s", out, art)
+                self.set_status(f"封面写入未完成：{P(out).name}（音频转换已完成）")
+        # Restore lyrics explicitly in the destination's native tag after FFmpeg.
+        # A lyric-write failure is logged but does not discard the converted audio.
+        if lyrics:
+            try:
+                wrote = write_lyrics(str(out), lyrics)
+                logger.info("LYRICS WRITE | output=%s | success=%s | chars=%d", out, wrote, len(lyrics))
+            except Exception:
+                logger.exception("LYRICS WRITE FAILED | output=%s", out)
+        if embedded_temp_cover:
+            try: P(embedded_temp_cover).unlink()
+            except OSError: pass
         item["output"]=str(out)
+        logger.info("CONVERSION SUCCESS | source=%s | output=%s | total_elapsed=%.3f sec", src, out, time.monotonic() - conversion_started)
+        log_file_info("OUTPUT", out)
 
 
 
