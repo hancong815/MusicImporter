@@ -1,31 +1,74 @@
 # MusicImporter
 
-A macOS music processing utility for audio conversion, metadata editing,
-album splitting, artwork management and Apple Music integration.
+**一站式音乐文件处理与导入工具，让下载的音乐更容易整理并加入 Apple Music。**
 
-## Features
+MusicImporter 面向日常音乐文件管理场景，整合音频格式转换、音乐文件拆分、元数据编辑、封面管理及 Apple Music 导入等功能。无论是下载的歌曲格式不兼容、歌曲信息不规范，还是整张专辑/合集需要拆分成独立曲目，都可以在一个应用中完成处理。
 
-- Batch audio format conversion
-- Metadata editing
-- Batch metadata editing
-- Artwork management
-- Album splitting with CUE or silence detection
-- Split preview and editable track boundaries
-- Apple Music integration
+## 工作流程
 
-## Requirements
+**选择文件 → 音乐处理 → 信息编辑 → 输出设置 → 完成导入**
 
-- macOS
-- Python 3
-- FFmpeg
-- Mutagen
+### 1. 导入音乐文件
 
-## Run from Source
+- 支持批量添加音乐文件，统一进行处理。
+- 支持常见音频格式，满足日常音乐整理需求。
+- 支持对下载的音乐文件进行批量操作，减少重复劳动。
 
-Install dependencies:
+### 2. 音乐处理
 
-    pip install -r requirements.txt
+根据实际需求选择处理方式：
 
-Run:
+- **音频格式转换**：将音乐转换为目标音频格式，适配不同播放器及音乐管理场景。
+- **音乐拆分**：支持将合集或连续音频拆分为独立歌曲，便于后续管理和播放。
+- **批量处理**：多个文件可统一执行处理任务，无需逐首操作。
+- **任务控制**：支持查看处理进度，并在需要时停止任务。
 
-    python3 MusicImporter.py
+### 3. 音乐信息编辑
+
+针对下载音乐信息不规范、命名混乱等问题，提供便捷的元数据整理功能：
+
+- 编辑歌曲名称
+- 编辑歌手
+- 编辑专辑名称
+- 批量修改歌曲信息
+- 支持根据文件名辅助识别和整理歌曲信息
+- 支持导入已有封面图片，并设置为音乐封面
+
+让音乐文件在进入音乐库之前，就拥有更加规范、完整的信息。
+
+### 4. 输出设置
+
+灵活控制处理后的音乐文件：
+
+- 自定义输出目录
+- 选择输出音频格式
+- 配置音乐文件保存方式
+- 支持将输出目录直接设置为 Apple Music 音乐文件目录，减少额外导入步骤
+
+### 5. 加入 Apple Music
+
+处理完成后，可以根据自己的使用习惯选择：
+
+- 将音乐输出至 Apple Music 对应的音乐文件目录，实现文件级导入。
+- 使用应用提供的 Apple Music 导入功能，完成音乐添加。
+
+无需在多个工具之间反复切换，即可完成从下载音乐到整理并加入音乐库的整个流程。
+
+## 功能特点
+
+- **一站式处理**：格式转换、音乐拆分、信息编辑、封面设置与音乐导入集中完成。
+- **批量操作**：减少逐首编辑和重复处理的时间。
+- **灵活的音乐整理**：支持歌曲名称、歌手、专辑及封面信息的编辑。
+- **简化导入流程**：支持通过输出目录直接完成 Apple Music 文件导入。
+- **任务管理**：提供处理进度查看及任务停止能力。
+- **简洁易用**：尽量减少不必要的操作，让音乐整理流程更直接。
+
+## 适用场景
+
+- 下载的音乐格式无法直接加入音乐库。
+- 下载歌曲的名称、歌手或专辑信息不规范。
+- 下载的是整张合集或连续音频，希望拆分成单曲。
+- 希望批量整理歌曲信息及封面。
+- 希望将整理后的音乐快速加入 Apple Music。
+
+MusicImporter 希望让音乐文件的整理与导入变得简单：**把文件交给它，完成必要的处理和整理，然后加入自己的音乐库。**
